@@ -177,6 +177,386 @@ App.source.handle( Todo, {
     }
 });
 
+/*
+    Terms for search parser that know how to test themselves.
+ */
+var BaseTerm = O.Class({
+
+    /* Constructor */
+    init: function ( value, fieldName ) {
+        this.value = value;
+        this.fieldName = fieldName;
+    },
+
+    /* Representation */
+    toString: function() {
+        return this.fieldName + ' : ' + this.value;
+    },
+
+    /* Does this term apply to the specified Todo instance? */
+    test: function( todo ) {
+        throw new Error( 'Not implemented!' );
+    }
+});
+
+/*
+     A term to match a word in the summary.
+ */
+var SummaryTerm = O.Class({
+
+    Extends: BaseTerm,
+
+    /* Constructor */
+    init: function (value) {
+        SummaryTerm.parent.init.call(this, value, 'summary');
+        this.regex = new RegExp( '\\b' + value.escapeRegExp(), 'i' );
+    },
+
+    /* Representation */
+    toString: function() {
+        return this.value + ' ∈ ' + this.fieldName;
+    },
+
+    /* Does this term apply to the specified Todo instance? */
+    test: function( todo ) {
+        // if no summary will always macth!
+        if ( todo.summary ) {
+            return this.regex.test( todo.summary );
+        }
+        return true;
+    }
+});
+
+/*
+    A term to query the isCompleted state.
+ */
+var CompletedTerm = O.Class({
+
+    Extends: BaseTerm,
+
+    /* Constructor */
+    init: function (value) {
+        CompletedTerm.parent.init.call(this, value, 'completed');
+    },
+
+    /* Representation */
+    toString: function() {
+        return this.fieldName + ' == ' + this.value;
+    },
+
+    /* Does this term apply to the specified Todo instance? */
+    test: function( todo ) {
+        return todo.isComplete == this.value;
+    }
+});
+
+/*
+    A group of parsed nodes
+ */
+var Group = O.Class({
+
+    /* Constructor */
+    init: function ( group, groupName ) {
+        this.groups = [];
+        if ( group ) {
+           this.groups.push( group );
+        }
+        this.name = groupName;
+    },
+
+    /* Extend */
+    add: function ( member ) {
+        this.groups.push( member );
+    },
+
+    /* Representation */
+    toString: function() {
+        var reprStr = '(';
+        var groupCount = this.groups.length;
+        var groupName = this.name;
+        this.groups.forEach( function ( group, index ) {
+            reprStr += group.toString();
+            if ( index < ( groupCount - 1 )) {
+                reprStr += (' ' + groupName + ' ');
+            }
+        });
+        return reprStr + ')';
+    }
+});
+
+/*
+    A group of parsed nodes that must all match.
+ */
+var AndGroup = O.Class({
+
+    Extends: Group,
+
+    /* Constructor */
+    init: function (groups) {
+        AndGroup.parent.init.call(this, groups, 'AND');
+    },
+
+    /* Does this term apply to the specified Todo instance? */
+    test: function( todo ) {
+        // check each, bailing early
+        return this.groups.every( function ( group ) {
+            return group.test( todo );
+        })
+
+    }
+});
+
+/*
+    A group of parsed nodes that can match any.
+ */
+var OrGroup = O.Class({
+
+    Extends: Group,
+
+    /* Constructor */
+    init: function (groups) {
+        OrGroup.parent.init.call(this, groups, 'OR');
+    },
+
+    /* Does this term apply to the specified Todo instance? */
+    test: function( todo ) {
+        // any match will do
+         return this.groups.some( function ( group ) {
+            return group.test( todo );
+        })
+    }
+});
+
+/// --- Search
+App.search = {
+
+    // create a Todo search parser
+    parser: function () {
+        var Parse = O.Parse,
+            define = Parse.define,
+            optional = Parse.optional,
+            repeat = Parse.repeat,
+            sequence = Parse.sequence,
+            firstMatch = Parse.firstMatch,
+            longestMatch = Parse.longestMatch;
+
+        var whitespace = define( 'whitespace', (/^(?:[\s]+|$)/) );
+        var is = define( 'is', /^(?:is:(done|notdone))/ );
+        var and = define( 'and', /^(?:[\s]*AND[\s]*)/ );
+        var or = define( 'or', /^(?:[\s]*OR[\s]*)/ );
+        var word = define( 'word', (/^(?:\w+)/) );
+
+        return longestMatch([
+            is,
+            word,
+            and,
+            or,
+            whitespace
+        ]);
+    }(),
+
+    // parse this string
+    parse: function( string ) {
+        var stringToParse = string,
+            topGroup = new AndGroup(),
+            currentGroup = null,
+            newGroup = null,
+            lastToken = null,
+            needTerm = true;
+
+        while ( stringToParse.length ) {
+            var parseInstance = new O.Parse( stringToParse );
+            if ( this.parser( parseInstance ) ) {
+                var charsParsed = 0;
+                if ( parseInstance.tokens ) {
+                    parseInstance.tokens.forEach( function ( token ) {
+                        charsParsed += token[1].length;
+                        switch ( token[0] ) {
+                            case 'word':
+                                lastToken = new SummaryTerm( token[1] );
+                                if (currentGroup) {
+                                    currentGroup.add(lastToken);
+                                    lastToken = null;
+                                }
+                                needTerm = false;
+                                break;
+                            case 'is':
+                                lastToken = new CompletedTerm( token[1] == 'is:done' );
+                                if (currentGroup) {
+                                    currentGroup.add( lastToken );
+                                    lastToken = null;
+                                }
+                                needTerm = false;
+                                break;
+                            case 'and':
+                            case 'whitespace':
+                                newGroup = currentGroup;
+                                if ( !currentGroup || currentGroup.name != 'AND' ) {
+                                    newGroup = new AndGroup( currentGroup );
+                                    if ( !currentGroup ) {
+                                        currentGroup = newGroup;
+                                    }
+                                }
+                                if ( lastToken ) {
+                                    currentGroup.add( lastToken );
+                                    lastToken = null;
+                                }
+                                currentGroup = newGroup;
+                                needTerm = true;
+                                break;
+                            case 'or':
+                                newGroup = currentGroup;
+                                if ( !currentGroup || currentGroup.name != 'OR' ) {
+                                    newGroup = new OrGroup( currentGroup );
+                                    if ( !currentGroup ) {
+                                        currentGroup = newGroup;
+                                    }
+                                }
+                                if ( lastToken ) {
+                                    currentGroup.add( lastToken );
+                                    lastToken = null;
+                                }
+                                currentGroup = newGroup;
+                                needTerm = true;
+                                break;
+                            default:
+                                throw new Error( 'Unknown token: ' + token[0] );
+                        }
+                    });
+
+                    // remove parsed tokens from the string
+                    stringToParse = stringToParse.substr( charsParsed );
+
+                } else {
+                    throw new Error( 'No tokens returned on successful parse of: ' + stringToParse );
+                }
+
+            } else {
+                throw new Error( 'Cannot parse string: ' + stringToParse );
+            }
+        }
+
+        // was it a valid query?
+        if ( needTerm ) {
+            throw new Error('Incomplete query - missing term');
+        }
+
+        // cleanup 'orphaned' tokens
+        if ( lastToken ) {
+            if ( !currentGroup ) {
+                newGroup = new AndGroup();
+            }
+            if ( !currentGroup ) currentGroup = topGroup;
+            currentGroup.add( lastToken );
+        }
+        return currentGroup;
+    }
+};
+
+/* poor mans unit test */
+App.unitTest = function() {
+    // test the parser phase..
+    var testsAndResults = [
+        {
+            search: 'foo',
+            result: '(foo ∈ summary)'
+        },
+        {
+            search: 'foo bar',
+            result: '(foo ∈ summary AND bar ∈ summary)'
+        },
+        {
+            search: 'foo bar baz bif',
+            result: '(foo ∈ summary AND bar ∈ summary AND baz ∈ summary AND bif ∈ summary)'
+        },
+        {
+            search: 'foo AND bar',
+            result: '(foo ∈ summary AND bar ∈ summary)'
+        },
+        {
+            search: 'foo AND bar AND baz bif',
+            result: '(foo ∈ summary AND bar ∈ summary AND baz ∈ summary AND bif ∈ summary)'
+        },
+        {
+            search: 'is:done',
+            result: '(completed == true)'
+        },
+        {
+            search: 'is:notdone',
+            result: '(completed == false)'
+        },
+        {
+            search: 'foo is:done',
+            result: '(foo ∈ summary AND completed == true)'
+        },
+        {
+            search: 'foo AND is:notdone',
+            result: '(foo ∈ summary AND completed == false)'
+        },
+        {
+            search: 'foo AND is:notdone bar AND baz bif',
+            result: '(foo ∈ summary AND completed == false AND bar ∈ summary AND baz ∈ summary AND bif ∈ summary)'
+        },
+        {
+            search: 'foo OR bar',
+            result: '(foo ∈ summary OR bar ∈ summary)'
+        },
+        {
+            search: 'foo AND bar OR baz',
+            result: '((foo ∈ summary AND bar ∈ summary) OR baz ∈ summary)'
+        },
+        // should handle duplicates...
+        {
+            search: 'foo AND AND bar',
+            result: '(foo ∈ summary AND bar ∈ summary)'
+        },
+        {
+            search: 'foo OR OR bar',
+            result: '(foo ∈ summary OR bar ∈ summary)'
+        },
+        {
+            search: 'foo AND AND AND is:notdone bar AND AND baz bif',
+            result: '(foo ∈ summary AND completed == false AND bar ∈ summary AND baz ∈ summary AND bif ∈ summary)'
+        },
+        // should handle multiple operators... last wins for now
+        {
+            search: 'foo AND OR bar',
+            result: '((foo ∈ summary) OR bar ∈ summary)'
+        },
+        {
+            search: 'foo OR AND bar',
+            result: '((foo ∈ summary) AND bar ∈ summary)'
+        },
+        // test broken queries
+        {
+            search: 'foo AND',
+            result: 'Error: Incomplete query - missing term'
+        },
+        {
+            search: 'foo OR \t\t',
+            result: 'Error: Incomplete query - missing term'
+        },
+        {
+            search: 'foo OR baz AND\t\t',
+            result: 'Error: Incomplete query - missing term'
+        }
+    ];
+
+    testsAndResults.forEach( function ( testArgs ) {
+        try {
+            var result = App.search.parse( testArgs.search );
+        } catch ( error ) {
+            result = error.toString();
+        }
+        if ( result != testArgs.result ) {
+            throw new Error( 'Unexpected result: ' + result + ' - expected: ' + testArgs.result );
+        }
+    });
+
+    console.info( 'Yay - all tests pass!!!' );
+};
+
+
 /// --- UI State & Routing
 
 /*
@@ -204,9 +584,19 @@ App.state = new O.Router({
     */
     todos: function () {
         var listId = this.get( 'listId' ),
-            search = this.get( 'search' ),
-            searchRegExp = search ?
-                new RegExp( '\\b' + search.escapeRegExp(), 'i' ) : null;
+            search = this.get( 'search'),
+            searchMatcher = null;
+
+        // for now ignore errors as they type...
+        // obviously it needs to add some alerting once typing has finished.
+        // e.g. turn query box red - event? Not sure how overture handles decoupling.
+        if ( search ) {
+            try {
+                searchMatcher = App.search.parse(search);
+            } catch ( error ) {
+                searchMatcher = null;
+            }
+        }
         return new O.LiveQuery({
             store: App.store,
             Type: Todo,
@@ -216,7 +606,7 @@ App.state = new O.Router({
             },
             filter: function ( data ) {
                 return ( data.listId === listId ) &&
-                    ( !searchRegExp || searchRegExp.test( data.summary ) );
+                    ( !searchMatcher || searchMatcher.test( data ) );
             }
         });
     }.property( 'listId', 'search' ),
@@ -713,7 +1103,7 @@ var appView = new O.View({
     }.on( 'dblclick' )
 });
 
-/* Insert the view we've constructred into the document */
+/* Insert the view we've constructed into the document */
 App.views.mainWindow.insertView( appView );
 
 /*  Because this setup code is not being run inside a run loop, we now need to
